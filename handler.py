@@ -1,124 +1,128 @@
-import os
-import json
-import time
 import base64
+import json
 import random
+import time
+from io import BytesIO
+
 import requests
 import runpod
-from io import BytesIO
 from PIL import Image
 
-# ---------- Defaults (can be overridden per request) ----------
+COMFY_URL = "http://127.0.0.1:8188"
+
 DEFAULTS = {
     "prompt": "make the sky red",
     "negative_prompt": "text, watermark, logo, blurry, low quality",
     "steps": 25,
     "cfg": 7.0,
-    "denoise": 0.30,          # keep low to preserve composition
-    "seed": -1,               # -1 means random
-    "sampler": "euler",
+    "denoise": 0.30,          # lower = closer to reference
+    "seed": -1,               # -1 => random
+    "sampler_name": "euler",
     "scheduler": "normal",
     "width": 512,
     "height": 512,
+    "jpeg_quality": 90
 }
 
-COMFY_URL = "http://127.0.0.1:8188"
+def get(inp, k):
+    return inp.get(k, DEFAULTS[k])
 
-def _get(inp, key):
-    return inp.get(key, DEFAULTS[key])
-
-def download_image(image_url: str) -> Image.Image:
+def fetch_image_bytes(url: str) -> bytes:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; RunpodServerless/1.0)"}
-    r = requests.get(image_url, headers=headers, timeout=60)
+    r = requests.get(url, headers=headers, timeout=60)
     r.raise_for_status()
-    im = Image.open(BytesIO(r.content)).convert("RGB")
-    return im
+    return r.content
 
-def image_to_png_b64(im: Image.Image) -> str:
+def normalize_to_png(image_bytes: bytes, width: int, height: int) -> bytes:
+    # ComfyUI input upload works well with PNG; normalize size here for consistent workflow
+    im = Image.open(BytesIO(image_bytes)).convert("RGB").resize((width, height))
     buf = BytesIO()
     im.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+    return buf.getvalue()
 
-def comfy_prompt(workflow: dict) -> dict:
+def comfy_upload_image(png_bytes: bytes, filename: str = "input.png") -> str:
+    # Upload to ComfyUI input folder
+    files = {"image": (filename, png_bytes, "image/png")}
+    r = requests.post(f"{COMFY_URL}/upload/image", files=files, timeout=60)
+    r.raise_for_status()
+    # returns {"name": "...", "subfolder": "", "type": "input"}
+    return r.json()["name"]
+
+def comfy_submit(workflow: dict) -> str:
     r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=60)
     r.raise_for_status()
-    return r.json()
+    return r.json()["prompt_id"]
 
-def comfy_history(prompt_id: str) -> dict:
-    r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=60)
-    r.raise_for_status()
-    return r.json()
+def comfy_wait_and_get_first_image_bytes(prompt_id: str, timeout_s: int = 600) -> bytes:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=60)
+        r.raise_for_status()
+        hist = r.json().get(prompt_id)
+
+        if hist and "outputs" in hist:
+            # Our workflow uses node id "save_image"
+            out = hist["outputs"]["save_image"]["images"][0]
+            params = {
+                "filename": out["filename"],
+                "subfolder": out.get("subfolder", ""),
+                "type": "output",
+            }
+            vr = requests.get(f"{COMFY_URL}/view", params=params, timeout=60)
+            vr.raise_for_status()
+            return vr.content
+
+        time.sleep(0.4)
+
+    raise TimeoutError("Timed out waiting for ComfyUI output")
+
+def png_bytes_to_jpeg_b64(png_bytes: bytes, quality: int = 90) -> str:
+    im = Image.open(BytesIO(png_bytes)).convert("RGB")
+    buf = BytesIO()
+    im.save(buf, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def handler(event):
     inp = event.get("input", {}) or {}
-
     image_url = inp.get("image_url")
     if not image_url:
         return {"error": "Missing required field: input.image_url"}
 
-    # parameters (defaults overridden by input JSON)
-    prompt = _get(inp, "prompt")
-    negative_prompt = _get(inp, "negative_prompt")
-    steps = int(_get(inp, "steps"))
-    cfg = float(_get(inp, "cfg"))
-    denoise = float(_get(inp, "denoise"))
-    width = int(_get(inp, "width"))
-    height = int(_get(inp, "height"))
-    sampler = _get(inp, "sampler")
-    scheduler = _get(inp, "scheduler")
-    seed = int(_get(inp, "seed"))
+    width = int(get(inp, "width"))
+    height = int(get(inp, "height"))
+
+    seed = int(get(inp, "seed"))
     if seed == -1:
         seed = random.randint(0, 2**31 - 1)
 
-    # download and convert input image to PNG base64 (ComfyUI-friendly)
-    init_image = download_image(image_url).resize((width, height))
-    init_image_b64 = image_to_png_b64(init_image)
+    prompt = get(inp, "prompt")
+    negative_prompt = get(inp, "negative_prompt")
 
-    # load workflow template from file
-    workflow = json.load(open("workflow_api_img2img_sdx15.json", "r"))
+    workflow = json.load(open("workflow_img2img_sd15.json", "r"))
 
-    # ---- Patch workflow fields (these keys depend on the workflow template) ----
-    # You will paste the workflow I provide below; these node ids match that file.
-    workflow["3"]["inputs"]["seed"] = seed
-    workflow["3"]["inputs"]["steps"] = steps
-    workflow["3"]["inputs"]["cfg"] = cfg
-    workflow["3"]["inputs"]["sampler_name"] = sampler
-    workflow["3"]["inputs"]["scheduler"] = scheduler
-    workflow["3"]["inputs"]["denoise"] = denoise
+    # Patch workflow values (node IDs must match the workflow file below)
+    workflow["load_image"]["inputs"]["image"] = None  # placeholder, set after upload
+    workflow["prompt_pos"]["inputs"]["text"] = prompt
+    workflow["prompt_neg"]["inputs"]["text"] = negative_prompt
 
-    workflow["6"]["inputs"]["text"] = prompt
-    workflow["7"]["inputs"]["text"] = negative_prompt
+    workflow["ksampler"]["inputs"]["seed"] = seed
+    workflow["ksampler"]["inputs"]["steps"] = int(get(inp, "steps"))
+    workflow["ksampler"]["inputs"]["cfg"] = float(get(inp, "cfg"))
+    workflow["ksampler"]["inputs"]["sampler_name"] = get(inp, "sampler_name")
+    workflow["ksampler"]["inputs"]["scheduler"] = get(inp, "scheduler")
+    workflow["ksampler"]["inputs"]["denoise"] = float(get(inp, "denoise"))
 
-    workflow["10"]["inputs"]["image"] = init_image_b64
+    # Download -> normalize -> upload to ComfyUI -> set LoadImage filename
+    raw = fetch_image_bytes(image_url)
+    png = normalize_to_png(raw, width, height)
+    uploaded_name = comfy_upload_image(png, filename="input.png")
+    workflow["load_image"]["inputs"]["image"] = uploaded_name
 
-    # send to ComfyUI
-    submit = comfy_prompt(workflow)
-    prompt_id = submit["prompt_id"]
+    prompt_id = comfy_submit(workflow)
+    out_png = comfy_wait_and_get_first_image_bytes(prompt_id)
 
-    # poll until result exists
-    deadline = time.time() + 600
-    while time.time() < deadline:
-        hist = comfy_history(prompt_id)
-        h = hist.get(prompt_id)
-        if h and "outputs" in h:
-            # Extract the first image from the SaveImage node output
-            # (again, depends on workflow template)
-            images = h["outputs"]["9"]["images"]
-            filename = images[0]["filename"]
-            subfolder = images[0].get("subfolder", "")
-            # fetch image bytes from ComfyUI
-            r = requests.get(f"{COMFY_URL}/view", params={"filename": filename, "subfolder": subfolder, "type": "output"}, timeout=60)
-            r.raise_for_status()
-            out_b64 = base64.b64encode(r.content).decode("utf-8")
-            return {
-                "image_b64": out_b64,
-                "seed": seed,
-                "width": width,
-                "height": height
-            }
-        time.sleep(0.5)
-
-    return {"error": "Timed out waiting for ComfyUI result"}
+    out_b64 = png_bytes_to_jpeg_b64(out_png, quality=int(get(inp, "jpeg_quality")))
+    return {"image_b64": out_b64, "seed": seed, "width": width, "height": height}
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
