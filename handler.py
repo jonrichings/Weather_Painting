@@ -27,7 +27,13 @@ def handler(event):
             }
 
         image_b64 = base64.b64encode(r.content).decode("utf-8")
-        return {"image_b64": image_b64, "bytes": len(r.content)}
+        #return {"image_b64": image_b64, "bytes": len(r.content)}
+        return {
+            "bytes": len(r.content),
+            "content_type": r.headers.get("content-type"),
+            "image_b64_prefix": image_b64[:200]
+        }
+
     except Exception as e:
         return {
             "error": str(e),
