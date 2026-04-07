@@ -14,12 +14,8 @@ def handler(event):
     r.raise_for_status()
 
     image_b64 = base64.b64encode(r.content).decode("utf-8")
-
-    return {
-        "image_b64": image_b64
-    }
+    return {"image_b64": image_b64}
 
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
-    
