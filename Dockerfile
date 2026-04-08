@@ -11,3 +11,15 @@ RUN comfy model download --url https://huggingface.co/stabilityai/stable-diffusi
 
 # copy all input data (like images or videos) into comfyui (uncomment and adjust if needed)
 # COPY input/ /comfyui/input/
+
+# ---- install Python deps for the Runpod serverless handler ----
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# ---- copy handler + workflow into the image ----
+COPY handler.py /app/handler.py
+COPY sdxl_simple_example.json /app/sdxl_simple_example.json
+
+# ---- start the Runpod serverless handler (it will talk to the local ComfyUI) ----
+CMD ["python3", "-u", "/app/handler.py"]
