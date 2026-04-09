@@ -14,6 +14,7 @@ RUN comfy model download --url https://huggingface.co/stabilityai/stable-diffusi
 
 WORKDIR /app
 COPY handler.py /app/handler.py
+COPY sdxl_simple_example.json /app/sdxl_simple_example.json
 
 ENTRYPOINT []
 CMD ["python3", "-u", "/app/handler.py"]
